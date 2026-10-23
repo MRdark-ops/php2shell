@@ -26,7 +26,7 @@ only an early debug form (`--workers 1` still reproduces it).
 ## Quick start (official php.ini-production / display_errors=Off / 128M)
 
 ```bash
-git clone https://github.com/9bie/php2shell-bypass-aslr-exp.git
+git clone https://github.com/MRdark-ops/php2shell.git
 cd php2shell-bypass-aslr-exp
 
 # 1) Start the target: stock official image; the container only copies the
